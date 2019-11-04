@@ -1050,6 +1050,32 @@ class TailInputTest < Test::Unit::TestCase
     d.instance_shutdown
   end
 
+  def test_pos_file_legacy_file_format_migrate_to_new_pos_file_format
+    config = config_element("", "", {
+      "tag" => "tail",
+      "path" => "#{TMP_DIR}/*.txt",
+      "format" => "none",
+      "pos_file" => "#{TMP_DIR}/pos/tail.pos",
+      "read_from_head" => true,
+      "refresh_interval" => 1
+    })
+    d = create_driver(config, false)
+    d.run(expect_emits: 1, shutdown: false) do
+      File.open("#{TMP_DIR}/pos/tail.pos", "wb") { |f| 
+        f.puts "#{TMP_DIR}/tail.txt\t0000000000000000\t0000000000000000\n" 
+      }
+      File.open("#{TMP_DIR}/tail.txt", "ab") { |f| f.puts "test3\n" }
+    end
+    assert_path_exist("#{TMP_DIR}/pos/tail.pos")
+
+    first_line_pos_file = ''
+    File.open("#{TMP_DIR}/pos/tail.pos", "r") { |f| first_line_pos_file = f.readline }
+    assert_equal(5, /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.match(first_line_pos_file).length)
+
+    cleanup_directory(TMP_DIR)
+    d.instance_shutdown
+  end
+
   def test_z_refresh_watchers
     plugin = create_driver(EX_CONFIG, false).instance
     sio = StringIO.new
