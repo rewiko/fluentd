@@ -49,6 +49,7 @@ module Fluent::Plugin
     def initialize
       super
       @paths = []
+      @threads = {}
       @tails = {}
       @pf_file = nil
       @pf = nil
@@ -74,6 +75,8 @@ module Fluent::Plugin
     config_param :refresh_interval, :time, default: 60
     desc 'The number of reading lines at each IO.'
     config_param :read_lines_limit, :integer, default: 1000
+    desc 'The number of reading bytes per second'
+    config_param :read_bytes_limit_per_second, :integer, default: -1
     desc 'The interval of flushing the buffer for multiline format'
     config_param :multiline_flush_interval, :time, default: nil
     desc 'Enable the option to emit unmatched lines.'
@@ -201,7 +204,15 @@ module Fluent::Plugin
       end
 
       refresh_watchers unless @skip_refresh_on_startup
-      timer_execute(:in_tail_refresh_watchers, @refresh_interval, &method(:refresh_watchers))
+
+      @threads['in_tail_refresh_watchers'] = Thread.new(@refresh_interval) do |refresh_interval|
+        timer_execute(:in_tail_refresh_watchers, @refresh_interval, &method(:refresh_watchers))
+      end
+      @threads['in_tail_refresh_watchers'].priority = 10 # Default is zero; higher-priority threads will run before lower-priority threads.
+      
+      @threads.each { |thr| 
+        thr.join
+      }
     end
 
     def stop
@@ -279,11 +290,16 @@ module Fluent::Plugin
 
       stop_watchers(unwatched, immediate: false, unwatched: true) unless unwatched.empty?
       start_watchers(added) unless added.empty?
+
+      log.debug "Thread refresh_watchers"
+      @threads.each { |thr| 
+            log.debug "Thread #{thr[0]} #{thr[1].status}"
+      }
     end
 
     def setup_watcher(path, pe)
       line_buffer_timer_flusher = (@multiline_mode && @multiline_flush_interval) ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
-      tw = TailWatcher.new(path, @rotate_wait, pe, log, @read_from_head, @enable_watch_timer, @enable_stat_watcher, @read_lines_limit, method(:update_watcher), line_buffer_timer_flusher, @from_encoding, @encoding, open_on_every_update, &method(:receive_lines))
+      tw = TailWatcher.new(path, @rotate_wait, pe, log, @read_from_head, @enable_watch_timer, @enable_stat_watcher, @read_lines_limit, @read_bytes_limit_per_second, method(:update_watcher), line_buffer_timer_flusher, @from_encoding, @encoding, open_on_every_update, &method(:receive_lines))
       tw.attach do |watcher|
         event_loop_attach(watcher.timer_trigger) if watcher.timer_trigger
         event_loop_attach(watcher.stat_trigger) if watcher.stat_trigger
@@ -302,31 +318,49 @@ module Fluent::Plugin
 
     def start_watchers(paths)
       paths.each { |path|
-        pe = nil
-        if @pf
-          pe = @pf[path]
-          if @read_from_head && pe.read_inode.zero?
-            begin
-              pe.update(Fluent::FileWrapper.stat(path).ino, 0)
-            rescue Errno::ENOENT
-              $log.warn "#{path} not found. Continuing without tailing it."
-            end
+        unless @threads[path].nil?
+          log.debug "Check Thread #{path} #{@threads[path].status}"
+          if @threads[path].status != "sleep" and  @threads[path].status != "run"
+            log.debug "Stopping Thread #{path} #{@threads[path].status}"
+            @threads[path].exit
+            @threads.delete(path)
           end
         end
+        if @threads[path].nil?
+          log.debug "Add Thread #{path}"
+          @threads[path] = Thread.new(path) do |path|
+            pe = nil
+            if @pf
+              pe = @pf[path]
+              if @read_from_head && pe.read_inode.zero?
+                begin
+                  pe.update(Fluent::FileWrapper.stat(path).ino, 0)
+                rescue Errno::ENOENT
+                  $log.warn "#{path} not found. Continuing without tailing it."
+                end
+              end
+            end
 
-        begin
-          tw = setup_watcher(path, pe)
-        rescue WatcherSetupError => e
-          log.warn "Skip #{path} because unexpected setup error happens: #{e}"
-          next
+            begin
+              tw = setup_watcher(path, pe)
+            rescue WatcherSetupError => e
+              log.warn "Skip #{path} because unexpected setup error happens: #{e}"
+              next
+            end
+            @tails[path] = tw
+          end
         end
-        @tails[path] = tw
       }
     end
 
     def stop_watchers(paths, immediate: false, unwatched: false, remove_watcher: true)
       paths.each { |path|
         tw = remove_watcher ? @tails.delete(path) : @tails[path]
+        if remove_watcher
+          @threads[path].exit
+          @threads.delete(path)
+        end
+
         if tw
           tw.unwatched = unwatched
           if immediate
@@ -340,6 +374,8 @@ module Fluent::Plugin
 
     def close_watcher_handles
       @tails.keys.each do |path|
+        @threads[path].exit
+        @threads.delete(path)
         tw = @tails.delete(path)
         if tw
           tw.close
@@ -356,6 +392,7 @@ module Fluent::Plugin
         end
       end
       rotated_tw = @tails[path]
+
       @tails[path] = setup_watcher(path, pe)
       detach_watcher_after_rotate_wait(rotated_tw) if rotated_tw
     end
@@ -494,7 +531,7 @@ module Fluent::Plugin
     end
 
     class TailWatcher
-      def initialize(path, rotate_wait, pe, log, read_from_head, enable_watch_timer, enable_stat_watcher, read_lines_limit, update_watcher, line_buffer_timer_flusher, from_encoding, encoding, open_on_every_update, &receive_lines)
+      def initialize(path, rotate_wait, pe, log, read_from_head, enable_watch_timer, enable_stat_watcher, read_lines_limit, read_bytes_limit_per_second, update_watcher, line_buffer_timer_flusher, from_encoding, encoding, open_on_every_update, &receive_lines)
         @path = path
         @rotate_wait = rotate_wait
         @pe = pe || MemoryPositionEntry.new
@@ -502,6 +539,7 @@ module Fluent::Plugin
         @enable_watch_timer = enable_watch_timer
         @enable_stat_watcher = enable_stat_watcher
         @read_lines_limit = read_lines_limit
+        @read_bytes_limit_per_second = read_bytes_limit_per_second
         @receive_lines = receive_lines
         @update_watcher = update_watcher
 
@@ -519,7 +557,7 @@ module Fluent::Plugin
       end
 
       attr_reader :path
-      attr_reader :log, :pe, :read_lines_limit, :open_on_every_update
+      attr_reader :log, :pe, :read_lines_limit, :read_bytes_limit_per_second, :open_on_every_update
       attr_reader :from_encoding, :encoding
       attr_reader :stat_trigger, :enable_watch_timer, :enable_stat_watcher
       attr_accessor :timer_trigger
@@ -747,16 +785,37 @@ module Fluent::Plugin
         def handle_notify
           with_io do |io|
             begin
+              bytes_to_read = 8192
+              number_bytes_read = 0
+              start_reading = Time.new
               read_more = false
 
               if !io.nil? && @lines.empty?
                 begin
                   while true
-                    @fifo << io.readpartial(8192, @iobuf)
+                    @fifo << io.readpartial(bytes_to_read, @iobuf)
                     @fifo.read_lines(@lines)
-                    if @lines.size >= @watcher.read_lines_limit
+
+                    number_bytes_read += bytes_to_read 
+                    limit_bytes_per_second_reached = (number_bytes_read >= @watcher.read_bytes_limit_per_second and @watcher.read_bytes_limit_per_second > 0)
+
+                    @watcher.log.debug("reading file: #{ @watcher.path}")
+                    if @lines.size >= @watcher.read_lines_limit or limit_bytes_per_second_reached 
                       # not to use too much memory in case the file is very large
                       read_more = true
+
+                      if limit_bytes_per_second_reached 
+                        # sleep to stop reading files when we reach the read bytes per second limit, to throttle the log ingestion
+                        time_spent_reading = Time.new - start_reading 
+                        @watcher.log.debug("time_spent_reading: #{time_spent_reading} #{ @watcher.path}")
+                        if (time_spent_reading < 1)
+                          debug_time = 1 - time_spent_reading
+                          @watcher.log.debug("sleep: #{debug_time}")
+                          sleep(1 - time_spent_reading)
+                        end
+                        start_reading = Time.new
+                      end
+
                       break
                     end
                   end
