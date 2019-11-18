@@ -49,6 +49,7 @@ module Fluent::Plugin
     def initialize
       super
       @paths = []
+      @threads = {}
       @tails = {}
       @pf_file = nil
       @pf = nil
@@ -203,7 +204,15 @@ module Fluent::Plugin
       end
 
       refresh_watchers unless @skip_refresh_on_startup
-      timer_execute(:in_tail_refresh_watchers, @refresh_interval, &method(:refresh_watchers))
+
+      @threads['in_tail_refresh_watchers'] = Thread.new(@refresh_interval) do |refresh_interval|
+        timer_execute(:in_tail_refresh_watchers, @refresh_interval, &method(:refresh_watchers))
+      end
+      @threads['in_tail_refresh_watchers'].priority = 10 # Default is zero; higher-priority threads will run before lower-priority threads.
+      
+      @threads.each { |thr| 
+        thr.join
+      }
     end
 
     def stop
@@ -281,6 +290,11 @@ module Fluent::Plugin
 
       stop_watchers(unwatched, immediate: false, unwatched: true) unless unwatched.empty?
       start_watchers(added) unless added.empty?
+
+      log.debug "Thread refresh_watchers"
+      @threads.each { |thr| 
+            log.debug "Thread #{thr[0]} #{thr[1].status}"
+      }
     end
 
     def setup_watcher(path, pe)
@@ -304,31 +318,49 @@ module Fluent::Plugin
 
     def start_watchers(paths)
       paths.each { |path|
-        pe = nil
-        if @pf
-          pe = @pf[path]
-          if @read_from_head && pe.read_inode.zero?
-            begin
-              pe.update(Fluent::FileWrapper.stat(path).ino, 0)
-            rescue Errno::ENOENT
-              $log.warn "#{path} not found. Continuing without tailing it."
-            end
+        unless @threads[path].nil?
+          log.debug "Check Thread #{path} #{@threads[path].status}"
+          if @threads[path].status != "sleep" and  @threads[path].status != "run"
+            log.debug "Stopping Thread #{path} #{@threads[path].status}"
+            @threads[path].exit
+            @threads.delete(path)
           end
         end
+        if @threads[path].nil?
+          log.debug "Add Thread #{path}"
+          @threads[path] = Thread.new(path) do |path|
+            pe = nil
+            if @pf
+              pe = @pf[path]
+              if @read_from_head && pe.read_inode.zero?
+                begin
+                  pe.update(Fluent::FileWrapper.stat(path).ino, 0)
+                rescue Errno::ENOENT
+                  $log.warn "#{path} not found. Continuing without tailing it."
+                end
+              end
+            end
 
-        begin
-          tw = setup_watcher(path, pe)
-        rescue WatcherSetupError => e
-          log.warn "Skip #{path} because unexpected setup error happens: #{e}"
-          next
+            begin
+              tw = setup_watcher(path, pe)
+            rescue WatcherSetupError => e
+              log.warn "Skip #{path} because unexpected setup error happens: #{e}"
+              next
+            end
+            @tails[path] = tw
+          end
         end
-        @tails[path] = tw
       }
     end
 
     def stop_watchers(paths, immediate: false, unwatched: false, remove_watcher: true)
       paths.each { |path|
         tw = remove_watcher ? @tails.delete(path) : @tails[path]
+        if remove_watcher
+          @threads[path].exit
+          @threads.delete(path)
+        end
+
         if tw
           tw.unwatched = unwatched
           if immediate
@@ -342,6 +374,8 @@ module Fluent::Plugin
 
     def close_watcher_handles
       @tails.keys.each do |path|
+        @threads[path].exit
+        @threads.delete(path)
         tw = @tails.delete(path)
         if tw
           tw.close
@@ -358,6 +392,7 @@ module Fluent::Plugin
         end
       end
       rotated_tw = @tails[path]
+
       @tails[path] = setup_watcher(path, pe)
       detach_watcher_after_rotate_wait(rotated_tw) if rotated_tw
     end
@@ -752,6 +787,7 @@ module Fluent::Plugin
             begin
               bytes_to_read = 8192
               number_bytes_read = 0
+              start_reading = Time.new
               read_more = false
 
               if !io.nil? && @lines.empty?
@@ -759,19 +795,29 @@ module Fluent::Plugin
                   while true
                     @fifo << io.readpartial(bytes_to_read, @iobuf)
                     @fifo.read_lines(@lines)
+
                     number_bytes_read += bytes_to_read 
-                    limit_bytes_per_second_reached = (@lines.size >= @watcher.read_bytes_limit_per_second and @watcher.read_bytes_limit_per_second > 0)
-                    if limit_bytes_per_second_reached 
-                      # stop reading files when we reach the read bytes limit per second, to throttle the log ingestion
-                      read_more = false
-                    elsif @lines.size >= @watcher.read_lines_limit
+                    limit_bytes_per_second_reached = (number_bytes_read >= @watcher.read_bytes_limit_per_second and @watcher.read_bytes_limit_per_second > 0)
+
+                    @watcher.log.debug("reading file: #{ @watcher.path}")
+                    if @lines.size >= @watcher.read_lines_limit or limit_bytes_per_second_reached 
                       # not to use too much memory in case the file is very large
                       read_more = true
-                    end
-                    if @lines.size >= @watcher.read_lines_limit or limit_bytes_per_second_reached 
+
+                      if limit_bytes_per_second_reached 
+                        # sleep to stop reading files when we reach the read bytes per second limit, to throttle the log ingestion
+                        time_spent_reading = Time.new - start_reading 
+                        @watcher.log.debug("time_spent_reading: #{time_spent_reading} #{ @watcher.path}")
+                        if (time_spent_reading < 1)
+                          debug_time = 1 - time_spent_reading
+                          @watcher.log.debug("sleep: #{debug_time}")
+                          sleep(1 - time_spent_reading)
+                        end
+                        start_reading = Time.new
+                      end
+
                       break
                     end
-
                   end
                 rescue EOFError
                 end
